@@ -27,16 +27,50 @@ using GLTFast.Utils;
 using UnityEditor;
 using UnityEditor.AssetImporters;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using Object = UnityEngine.Object;
 
 namespace GLTFast.Editor
 {
+    /// <summary>
+    /// CursedForge fork: compression of the embedded glTF textures at Editor import, for Android only.
+    /// glTFast creates every embedded PNG/JPEG as an uncompressed RGBA32 Texture2D sub-asset. On the
+    /// Quest APK that made textures 2.6 GB of 2.8 GB. When the import context's selected build target is
+    /// Android, <see cref="GltfImporter"/> compresses each created texture with
+    /// <see cref="EditorUtility.CompressTexture(Texture2D, TextureFormat, TextureCompressionQuality)"/>.
+    /// Other build targets (Standalone, the Editor, the simulator) keep the uncompressed textures.
+    /// Define GLTFAST_ANDROID_TEXTURE_COMPRESSION_OFF in the Player scripting defines to switch it off
+    /// (then bump the importer version or reimport the models, a define change alone does not reimport).
+    /// </summary>
+    public static class AndroidTextureCompression
+    {
+#if GLTFAST_ANDROID_TEXTURE_COMPRESSION_OFF
+        /// <summary>False: the scripting define GLTFAST_ANDROID_TEXTURE_COMPRESSION_OFF is set.</summary>
+        public const bool Enabled = false;
+#else
+        /// <summary>True: Android imports compress the embedded textures.</summary>
+        public const bool Enabled = true;
+#endif
+
+        /// <summary>
+        /// One format for every texture role (base colour, emission, occlusion, metallic-roughness, normal).
+        /// ASTC keeps the RGBA channel layout, so alpha stays and the normal map stays XYZ in RGB, which
+        /// glTFast's own normal decode (Runtime/Shader/Includes/Normal.cginc, NormalInTangentSpace_float)
+        /// reads from .xy with x scaled by .w. No swizzle is needed.
+        /// </summary>
+        public const TextureFormat Format = TextureFormat.ASTC_6x6;
+
+        /// <summary>Encoder quality for <see cref="EditorUtility.CompressTexture(Texture2D, TextureFormat, TextureCompressionQuality)"/>.</summary>
+        public const TextureCompressionQuality Quality = TextureCompressionQuality.Normal;
+    }
+
 
 #if ENABLE_DEFAULT_GLB_IMPORTER
-    [ScriptedImporter(1, new[] { "gltf", "glb" })]
+    // Version 2 (CursedForge fork): Android imports compress textures, so every model reimports once.
+    [ScriptedImporter(2, new[] { "gltf", "glb" })]
 #else
-    [ScriptedImporter(1, null, overrideExts: new[] { "gltf","glb" })]
+    [ScriptedImporter(2, null, overrideExts: new[] { "gltf","glb" })]
 #endif
     class GltfImporter : ScriptedImporter
     {
@@ -113,7 +147,23 @@ namespace GLTFast.Editor
                 instantiationSettings = new InstantiationSettings();
             }
 
-            var success = AsyncHelpers.RunSync(() => m_Gltf.Load(ctx.assetPath, importSettings));
+            // CursedForge fork: reading ctx.selectedBuildTarget registers a dependency on the build
+            // target (Unity 6000.5 docs: "Returns the current build target and creates a dependency on
+            // the target platform within a scripted importer"), so a platform switch reimports the model.
+            var compressForAndroid = AndroidTextureCompression.Enabled
+                && ctx.selectedBuildTarget == BuildTarget.Android;
+
+            // CompressTexture works on the CPU copy of the pixels. Load readable for Android with a
+            // copy of the settings (the serialized importSettings stay unchanged), then drop the CPU
+            // copy after compression when the user settings ask for non-readable textures.
+            var loadSettings = importSettings;
+            if (compressForAndroid && !importSettings.TexturesReadable)
+            {
+                loadSettings = JsonUtility.FromJson<ImportSettings>(JsonUtility.ToJson(importSettings));
+                loadSettings.TexturesReadable = true;
+            }
+
+            var success = AsyncHelpers.RunSync(() => m_Gltf.Load(ctx.assetPath, loadSettings));
 
             CollectingLogger instantiationLogger = null;
             if (success)
@@ -169,6 +219,10 @@ namespace GLTFast.Editor
                         var textureAssetPath = AssetDatabase.GetAssetPath(texture);
                         if (string.IsNullOrEmpty(textureAssetPath))
                         {
+                            if (compressForAndroid)
+                            {
+                                CompressForAndroid(texture, !importSettings.TexturesReadable);
+                            }
                             AddObjectToAsset(ctx, $"textures/{texture.name}", texture);
                         }
                     }
@@ -368,6 +422,36 @@ namespace GLTFast.Editor
             if (sceneIndex == m_Gltf.DefaultSceneIndex && !materialsVariantIndex.HasValue)
             {
                 ctx.SetMainObject(sceneGo);
+            }
+        }
+
+        /// <summary>
+        /// CursedForge fork: compresses one created texture in place (materials keep their reference).
+        /// Keeps the mip chain (CompressTexture compresses every existing level) and the sRGB/linear state
+        /// (checked after, a change logs a warning). Skips a texture that is already compressed (KTX).
+        /// </summary>
+        void CompressForAndroid(Texture2D texture, bool makeNonReadable)
+        {
+            var before = texture.graphicsFormat;
+            if (GraphicsFormatUtility.IsCompressedFormat(before))
+            {
+                return;
+            }
+            if (!texture.isReadable)
+            {
+                Debug.LogWarning($"glTFast Android compression: texture {texture.name} in {assetPath} is not readable, it stays {before}.", this);
+                return;
+            }
+            var wasSrgb = GraphicsFormatUtility.IsSRGBFormat(before);
+            EditorUtility.CompressTexture(texture, AndroidTextureCompression.Format, AndroidTextureCompression.Quality);
+            if (GraphicsFormatUtility.IsSRGBFormat(texture.graphicsFormat) != wasSrgb)
+            {
+                Debug.LogWarning($"glTFast Android compression: texture {texture.name} in {assetPath} changed sRGB state ({before} to {texture.graphicsFormat}).", this);
+            }
+            if (makeNonReadable)
+            {
+                // Drop the CPU copy so the device does not hold the texture twice.
+                texture.Apply(false, true);
             }
         }
 
